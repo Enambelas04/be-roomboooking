@@ -16,7 +16,12 @@ process.env.NODE_ENV = "test";
 
 // Dedicated test database. Relative paths in DATABASE_URL resolve against the
 // prisma/ directory, so this is prisma/test.db.
-process.env.DATABASE_URL = "file:./test.db";
+//
+// A project may override this (the rate-limit project points at its own file)
+// to keep the two vitest projects off the same SQLite file — otherwise a
+// lingering write lock in one project can surface as an unrelated failure in
+// the other.
+process.env.DATABASE_URL ??= "file:./test.db";
 
 // Valid configuration that satisfies the startup validator.
 process.env.JWT_SECRET = "test-secret-test-secret-test-secret-1234";
@@ -30,12 +35,13 @@ process.env.CORS_ORIGINS = "http://localhost:5173";
 process.env.BODY_LIMIT = "100kb";
 
 // Rate limiters are constructed once per module load, so their counters are
-// shared across every test in a file. Keep them high here; rate limiting is
-// exercised separately in tests/rate-limit.test.ts.
-process.env.RATE_LIMIT_AUTH_MAX = "10000";
-process.env.RATE_LIMIT_BOOKING_MAX = "10000";
-process.env.RATE_LIMIT_PAYMENT_MAX = "10000";
-process.env.RATE_LIMIT_WINDOW_MS = "60000";
+// shared across every test in a file. Default them high so ordinary suites are
+// never limited; the rate-limit suite supplies its own low limits through its
+// vitest project's `env` block, and those must not be overwritten here.
+process.env.RATE_LIMIT_AUTH_MAX ??= "10000";
+process.env.RATE_LIMIT_BOOKING_MAX ??= "10000";
+process.env.RATE_LIMIT_PAYMENT_MAX ??= "10000";
+process.env.RATE_LIMIT_WINDOW_MS ??= "60000";
 
 // Bring the test schema up to date. `migrate deploy` is idempotent, so running
 // it once per test file is safe and cheap.

@@ -17,6 +17,7 @@ import {
   createRoom,
   login,
   resetDb,
+  suiteEmail,
 } from "./helpers/fixtures";
 
 const app = createApp();
@@ -27,11 +28,11 @@ beforeEach(async () => {
 
 describe("JWT authentication", () => {
   it("issues a token for valid HOST credentials", async () => {
-    await createHost();
+    const host = await createHost();
 
     const res = await request(app)
       .post("/api/host/login")
-      .send({ email: "host@example.com", password: "hostpass123" });
+      .send({ email: host.email, password: "hostpass123" });
 
     expect(res.status).toBe(200);
     expect(typeof res.body.token).toBe("string");
@@ -39,34 +40,34 @@ describe("JWT authentication", () => {
   });
 
   it("issues a token for valid ADMIN credentials", async () => {
-    await createAdmin();
+    const admin = await createAdmin();
 
     const res = await request(app)
       .post("/api/admin/login")
-      .send({ email: "admin@example.com", password: "adminpass123" });
+      .send({ email: admin.email, password: "adminpass123" });
 
     expect(res.status).toBe(200);
     expect(res.body.user.role).toBe("ADMIN");
   });
 
   it("rejects a wrong password", async () => {
-    await createHost();
+    const host = await createHost();
     const res = await request(app)
       .post("/api/host/login")
-      .send({ email: "host@example.com", password: "wrong" });
+      .send({ email: host.email, password: "wrong" });
     expect(res.status).toBe(401);
     expect(res.body.error.code).toBe("UNAUTHORIZED");
   });
 
   it("returns the same error for an unknown account and a wrong password", async () => {
-    await createHost();
+    const host = await createHost();
 
     const unknown = await request(app)
       .post("/api/host/login")
       .send({ email: "ghost@example.com", password: "whatever" });
     const wrong = await request(app)
       .post("/api/host/login")
-      .send({ email: "host@example.com", password: "wrong" });
+      .send({ email: host.email, password: "wrong" });
 
     expect(unknown.status).toBe(wrong.status);
     expect(unknown.body.error.code).toBe(wrong.body.error.code);
@@ -79,61 +80,66 @@ describe("JWT authentication", () => {
 
     const res = await request(app)
       .post("/api/host/login")
-      .send({ email: "host@example.com", password: "hostpass123" });
+      .send({ email: host.email, password: "hostpass123" });
 
     expect(res.status).toBe(401);
   });
 
   it("refuses HOST credentials at the ADMIN login", async () => {
-    await createHost();
+    const host = await createHost();
     const res = await request(app)
       .post("/api/admin/login")
-      .send({ email: "host@example.com", password: "hostpass123" });
+      .send({ email: host.email, password: "hostpass123" });
     expect(res.status).toBe(401);
   });
 
   it("refuses ADMIN credentials at the HOST login", async () => {
-    await createAdmin();
+    const admin = await createAdmin();
     const res = await request(app)
       .post("/api/host/login")
-      .send({ email: "admin@example.com", password: "adminpass123" });
+      .send({ email: admin.email, password: "adminpass123" });
     expect(res.status).toBe(401);
   });
 
   it("never returns a password hash", async () => {
-    await createHost();
+    const host = await createHost();
     const res = await request(app)
       .post("/api/host/login")
-      .send({ email: "host@example.com", password: "hostpass123" });
+      .send({ email: host.email, password: "hostpass123" });
     expect(JSON.stringify(res.body)).not.toContain("passwordHash");
     expect(JSON.stringify(res.body)).not.toContain("$2");
   });
 
   it("normalizes the login email so case does not matter", async () => {
-    await createHost(); // stored as host@example.com
+    const host = await createHost();
 
+    // Same address, different casing: the lookup must still find the account.
     const res = await request(app)
       .post("/api/host/login")
-      .send({ email: "HOST@Example.COM", password: "hostpass123" });
+      .send({ email: host.email.toUpperCase(), password: "hostpass123" });
 
     expect(res.status).toBe(200);
+    expect(res.body.user.email).toBe(host.email);
   });
 
   it("stores a normalized email when an admin creates a user", async () => {
-    await createAdmin();
-    const token = await login(app, "admin", "admin@example.com", "adminpass123");
+    const admin = await createAdmin();
+    const token = await login(app, "admin", admin.email, "adminpass123");
+
+    const mixedCase = `${suiteEmail("NewHost")}`.toUpperCase();
+    const expected = mixedCase.toLowerCase();
 
     const created = await request(app)
       .post("/api/admin/users")
       .set("Authorization", `Bearer ${token}`)
-      .send({ email: "NewHost@Example.COM", password: "newhostpass1", role: "HOST" });
+      .send({ email: mixedCase, password: "newhostpass1", role: "HOST" });
 
     expect(created.status).toBe(201);
-    expect(created.body.user.email).toBe("newhost@example.com");
+    expect(created.body.user.email).toBe(expected);
 
     const loginRes = await request(app)
       .post("/api/host/login")
-      .send({ email: "NewHost@Example.COM", password: "newhostpass1" });
+      .send({ email: mixedCase, password: "newhostpass1" });
     expect(loginRes.status).toBe(200);
   });
 
@@ -171,8 +177,8 @@ describe("HOST RBAC", () => {
   });
 
   it("blocks an ADMIN from HOST routes", async () => {
-    await createAdmin();
-    const token = await login(app, "admin", "admin@example.com", "adminpass123");
+    const admin = await createAdmin();
+    const token = await login(app, "admin", admin.email, "adminpass123");
 
     const res = await request(app).get("/api/host/rooms").set("Authorization", `Bearer ${token}`);
     expect(res.status).toBe(403);
@@ -253,8 +259,8 @@ describe("HOST ownership enforcement", () => {
 
 describe("ADMIN RBAC", () => {
   it("lets an ADMIN read all administrative resources", async () => {
-    await createAdmin();
-    const token = await login(app, "admin", "admin@example.com", "adminpass123");
+    const admin = await createAdmin();
+    const token = await login(app, "admin", admin.email, "adminpass123");
 
     for (const path of [
       "/api/admin/users",
@@ -270,9 +276,9 @@ describe("ADMIN RBAC", () => {
   });
 
   it("does not expose password hashes in the admin user list", async () => {
-    await createAdmin();
-    await createHost();
-    const token = await login(app, "admin", "admin@example.com", "adminpass123");
+    const admin = await createAdmin();
+    const host = await createHost();
+    const token = await login(app, "admin", admin.email, "adminpass123");
 
     const res = await request(app).get("/api/admin/users").set("Authorization", `Bearer ${token}`);
 

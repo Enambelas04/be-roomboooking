@@ -12,42 +12,50 @@ import { prisma } from "../../src/database/prisma";
 import { hashPassword } from "../../src/auth/password";
 import { MockPaymentGateway } from "../../src/payment/MockPaymentGateway";
 import { Role } from "../../src/domain/statuses";
+import { resetDb, suiteEmail } from "./isolation";
+
+export { resetDb, suiteEmail };
 
 export const gateway = new MockPaymentGateway();
 
-/** Tables in FK-safe deletion order. */
-const TABLES = [
-  "Notification",
-  "LedgerEntry",
-  "Refund",
-  "PaymentEvent",
-  "WebhookEvent",
-  "Payment",
-  "Booking",
-  "Room",
-  "User",
-] as const;
-
-/** Truncate every table so each test starts from a known empty state. */
-export async function resetDb(): Promise<void> {
-  for (const table of TABLES) {
-    await prisma.$executeRawUnsafe(`DELETE FROM "${table}"`);
-  }
-}
-
 // ---------------------------------------------------------------------------
 // Identity
+//
+// Fixtures default to suite-scoped emails. Hardcoded addresses made two suites
+// collide whenever a previous suite had left rows behind, producing failures
+// that looked unrelated to their cause. Tests that must reference a specific
+// address still pass one explicitly.
 // ---------------------------------------------------------------------------
 
-export async function createHost(email = "host@example.com", password = "hostpass123") {
+/** The default fixture host address, unique per suite. */
+export function hostEmail(): string {
+  return suiteEmail("host");
+}
+
+/** The default fixture admin address, unique per suite. */
+export function adminEmail(): string {
+  return suiteEmail("admin");
+}
+
+export async function createHost(email?: string, password = "hostpass123") {
   return prisma.user.create({
-    data: { email, passwordHash: await hashPassword(password), role: Role.HOST, name: "Host" },
+    data: {
+      email: email ?? hostEmail(),
+      passwordHash: await hashPassword(password),
+      role: Role.HOST,
+      name: "Host",
+    },
   });
 }
 
-export async function createAdmin(email = "admin@example.com", password = "adminpass123") {
+export async function createAdmin(email?: string, password = "adminpass123") {
   return prisma.user.create({
-    data: { email, passwordHash: await hashPassword(password), role: Role.ADMIN, name: "Admin" },
+    data: {
+      email: email ?? adminEmail(),
+      passwordHash: await hashPassword(password),
+      role: Role.ADMIN,
+      name: "Admin",
+    },
   });
 }
 

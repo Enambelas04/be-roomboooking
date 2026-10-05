@@ -51,7 +51,7 @@ describe("public room browsing", () => {
     const room = await createRoom(host.id, 100_000, "Hidden Room");
     await request(app)
       .delete(`/api/host/rooms/${room.id}`)
-      .set("Authorization", `Bearer ${await loginHost()}`);
+      .set("Authorization", `Bearer ${await loginAs(host.email)}`);
 
     const res = await request(app).get("/api/rooms");
     expect(res.body.rooms).toHaveLength(0);
@@ -64,10 +64,11 @@ describe("public room browsing", () => {
   });
 });
 
-async function loginHost() {
+/** Log in as the suite's fixture host (suite-scoped email). */
+async function loginAs(email: string) {
   const res = await request(app)
     .post("/api/host/login")
-    .send({ email: "host@example.com", password: "hostpass123" });
+    .send({ email, password: "hostpass123" });
   return res.body.token;
 }
 
