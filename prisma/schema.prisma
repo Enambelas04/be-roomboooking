@@ -165,9 +165,15 @@ model Refund {
 
   payment Payment @relation(fields: [paymentId], references: [id], onDelete: Cascade)
 
-  // A payment can be refunded at most once. Guards the double-refund race: two
-  // concurrent refunds cannot both insert a SUCCEEDED row.
-  @@unique([paymentId, status])
+  // A payment has exactly ONE refund identity.
+  //
+  // This must be unique on paymentId alone — not on (paymentId, status).
+  // With status in the key, the claim slot is freed as soon as the winning
+  // refund moves from PENDING to SUCCEEDED, which let a slow concurrent caller
+  // insert a second PENDING row and invoke the provider a second time. Keying
+  // on paymentId alone makes the identity permanent for the payment's lifetime,
+  // so the provider can never be asked to refund the same payment twice.
+  @@unique([paymentId])
   @@index([paymentId])
   @@index([status])
 }

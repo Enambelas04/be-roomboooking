@@ -495,17 +495,23 @@ export class PaymentService {
   /**
    * Refund a PAID payment (PRD §23).
    *
-   * Concurrency (audit fix F3): the operation is claimed by inserting a PENDING
-   * Refund row, which is unique per payment. Exactly one caller wins, so the
-   * provider is never asked to refund twice and the ledger cannot receive two
-   * REFUND entries. If the provider call fails the claim is released so the
-   * refund can be retried.
+   * Concurrency model
+   * -----------------
+   * A payment has exactly ONE refund identity: `Refund` is unique on
+   * `paymentId` alone. That row is the claim, and the provider is called only
+   * by the caller that successfully created it.
    *
-   * Note on the crash window: if the process dies between the provider call and
-   * the transaction below, a PENDING Refund row remains and the payment is
-   * still PAID. That state is detectable and safely re-runnable; it is
-   * deliberately not auto-resolved because only the provider knows whether the
-   * money moved.
+   *   - The claim insert is the mutex. Exactly one concurrent caller wins it.
+   *   - A caller that loses the insert converges on the existing refund: it
+   *     waits for the winner to finish and returns the same result, without
+   *     ever touching the provider. This satisfies "at most one provider call
+   *     per refund intent".
+   *   - The row is never deleted on a provider failure. Deleting it would
+   *     re-open the claim slot and let a concurrent caller start a second
+   *     provider refund. It is marked FAILED instead, which keeps the identity
+   *     permanent and makes the refund explicitly retryable by an operator.
+   *   - Because the identity is permanent, no orphaned PENDING row can be left
+   *     behind by a race: the row either reaches SUCCEEDED or FAILED.
    */
   async refund(paymentId: string, reason?: string) {
     const payment = await prisma.payment.findUnique({ where: { id: paymentId } });
@@ -518,7 +524,12 @@ export class PaymentService {
     }
 
     // --- Claim ---------------------------------------------------------------
-    let refundRowId: string;
+    // Unique(paymentId) is the mutex: one caller wins, everyone else converges.
+    //
+    // If a previous attempt FAILED, the identity still exists and may be taken
+    // over by a conditional update, which keeps failed refunds retryable while
+    // still allowing only one caller to proceed at a time.
+    let refundRowId: string | null = null;
     try {
       const row = await prisma.refund.create({
         data: {
@@ -530,12 +541,25 @@ export class PaymentService {
       });
       refundRowId = row.id;
     } catch {
-      // Unique(paymentId) rejected the insert: a refund already exists or is
-      // in flight.
-      throw conflict("A refund for this payment is already in progress or completed");
+      // The identity already exists. Take it over only if the previous attempt
+      // FAILED (a retry); otherwise another caller holds or completed it.
+      const takeover = await prisma.refund.updateMany({
+        where: { paymentId, status: RefundStatus.FAILED },
+        data: { status: RefundStatus.PENDING, reason: reason ?? null },
+      });
+      if (takeover.count === 1) {
+        const row = await prisma.refund.findUnique({ where: { paymentId } });
+        refundRowId = row?.id ?? null;
+      }
     }
 
-    // --- Provider ------------------------------------------------------------
+    if (!refundRowId) {
+      // Another caller holds the claim, or the refund already succeeded.
+      // Converge on their result instead of calling the provider again.
+      return this.awaitExistingRefund(paymentId);
+    }
+
+    // --- Provider (winner only) ---------------------------------------------
     let refundResult;
     try {
       const gateway = getGateway(payment.provider);
@@ -545,8 +569,11 @@ export class PaymentService {
         reason,
       });
     } catch (err) {
-      // Release the claim so the refund can be retried.
-      await prisma.refund.delete({ where: { id: refundRowId } }).catch(() => undefined);
+      // Mark FAILED rather than deleting: deleting would free the claim slot
+      // and allow a second provider call from a concurrent request.
+      await prisma.refund
+        .update({ where: { id: refundRowId }, data: { status: RefundStatus.FAILED } })
+        .catch(() => undefined);
       throw err;
     }
 
@@ -560,7 +587,8 @@ export class PaymentService {
     // --- Persist atomically --------------------------------------------------
     try {
       await prisma.$transaction(async (tx) => {
-        // Second claim: the payment transition itself.
+        // Conditional transition: only the caller still holding a PAID payment
+        // may move it to REFUNDED and post the ledger entry.
         const res = await tx.payment.updateMany({
           where: { id: paymentId, status: PaymentStatus.PAID },
           data: { status: PaymentStatus.REFUNDED },
@@ -606,6 +634,41 @@ export class PaymentService {
 
     logger.info("payment refunded", { paymentId, amount: payment.amount });
     return { paymentId, status: PaymentStatus.REFUNDED };
+  }
+
+  /**
+   * Converge a losing concurrent refund onto the winning one.
+   *
+   * Polls briefly for the winner to reach a terminal state, then returns the
+   * same result the winner produced. This never calls the provider.
+   */
+  private async awaitExistingRefund(
+    paymentId: string,
+  ): Promise<{ paymentId: string; status: string }> {
+    const deadline = Date.now() + 5_000;
+    let row = await prisma.refund.findUnique({ where: { paymentId } });
+
+    while (row && row.status === RefundStatus.PENDING && Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 25));
+      row = await prisma.refund.findUnique({ where: { paymentId } });
+    }
+
+    if (!row) {
+      // The claim existed a moment ago but is gone; treat as a conflict.
+      throw conflict("A refund for this payment is already in progress or completed");
+    }
+
+    if (row.status === RefundStatus.SUCCEEDED) {
+      // The winner completed: report the converged outcome.
+      return { paymentId, status: PaymentStatus.REFUNDED };
+    }
+
+    if (row.status === RefundStatus.FAILED) {
+      throw paymentError("A previous refund attempt for this payment failed");
+    }
+
+    // Still PENDING past the deadline: the winner is unusually slow.
+    throw conflict("A refund for this payment is already in progress");
   }
 
   /** Ledger entries for one payment (ADMIN). */
