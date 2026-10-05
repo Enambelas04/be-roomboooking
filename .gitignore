@@ -1,0 +1,30 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+coverage/
+
+# Logs
+logs/
+*.log
+npm-debug.log*
+
+# Environment — never commit real secrets
+.env
+.env.*
+!.env.example
+
+# Local databases
+*.db
+*.db-journal
+*.db-shm
+*.db-wal
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# Prisma generated client lives in node_modules/.prisma — do NOT ignore prisma/ or *.prisma

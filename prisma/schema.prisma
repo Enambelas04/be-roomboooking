@@ -1,0 +1,214 @@
+// Room Booking Platform — Prisma schema
+//
+// Development: SQLite (see .env DATABASE_URL)
+// Production:  PostgreSQL — see README "SQLite -> PostgreSQL Migration"
+//
+// NOTE ON ENUMS: SQLite does not support native enums, so status/role fields
+// are stored as String with the allowed values defined in src/domain/statuses.ts
+// and validated in the service layer. When migrating to PostgreSQL you may
+// re-introduce native enums (PRD §28 step 3) — the string values below are
+// chosen to match those enum members exactly.
+//
+// NOTE ON MONEY: all monetary values are INTEGER minor units (PRD §20).
+// e.g. Rp825,000 is stored as 825000. Never Float/Decimal for money.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+// ---------------------------------------------------------------------------
+// Identity — only two authenticated roles exist: HOST and ADMIN (PRD §15).
+// Guests are unauthenticated and have no User row.
+// ---------------------------------------------------------------------------
+model User {
+  id           String   @id @default(cuid())
+  email        String   @unique
+  passwordHash String
+  name         String?
+  role         String // HOST | ADMIN
+  isActive     Boolean  @default(true)
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  rooms Room[]
+
+  @@index([role])
+}
+
+// ---------------------------------------------------------------------------
+// Inventory
+// ---------------------------------------------------------------------------
+model Room {
+  id            String   @id @default(cuid())
+  hostId        String
+  name          String
+  description   String?
+  pricePerNight Int // minor units
+  capacity      Int      @default(2)
+  isActive      Boolean  @default(true)
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  host     User      @relation(fields: [hostId], references: [id], onDelete: Cascade)
+  bookings Booking[]
+
+  @@index([hostId])
+  @@index([isActive])
+}
+
+// ---------------------------------------------------------------------------
+// Booking — created by an unauthenticated guest.
+// trackingToken is the secure, non-guessable handle used to read booking
+// status without an account (PRD §10). It must never be a sequential id.
+// ---------------------------------------------------------------------------
+model Booking {
+  id             String   @id @default(cuid())
+  roomId         String
+  customerName   String
+  customerEmail  String
+  customerPhone  String?
+  checkIn        DateTime
+  checkOut       DateTime
+  nights         Int
+  totalAmount    Int // minor units, authoritative server-side amount
+  status         String // PENDING_PAYMENT | PAID | CONFIRMED | PAYMENT_FAILED | EXPIRED | REFUNDED | CANCELLED
+  trackingToken  String   @unique
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  room           Room            @relation(fields: [roomId], references: [id], onDelete: Restrict)
+  payments       Payment[]
+  notifications  Notification[]
+
+  @@index([roomId, checkIn, checkOut])
+  @@index([status])
+  @@index([customerEmail])
+}
+
+// ---------------------------------------------------------------------------
+// Payment — state may only be changed by PaymentService (PRD §4).
+// idempotencyKey dedupes client retries of payment creation (PRD §4).
+// ---------------------------------------------------------------------------
+model Payment {
+  id             String   @id @default(cuid())
+  bookingId      String
+  provider       String // mock | midtrans | xendit
+  providerRef    String? // gateway-side transaction id
+  amount         Int // minor units — must equal booking.totalAmount
+  status         String // PENDING | PAID | FAILED | EXPIRED | CANCELLED | REFUNDED
+  idempotencyKey String   @unique
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  booking      Booking        @relation(fields: [bookingId], references: [id], onDelete: Cascade)
+  events       PaymentEvent[]
+  refunds      Refund[]
+  ledgerEntries LedgerEntry[]
+
+  @@index([bookingId])
+  @@index([status])
+  @@index([providerRef])
+}
+
+// ---------------------------------------------------------------------------
+// PaymentEvent — append-only audit trail of state transitions.
+// ---------------------------------------------------------------------------
+model PaymentEvent {
+  id        String   @id @default(cuid())
+  paymentId String
+  type      String // CREATED | STATE_CHANGE | WEBHOOK_RECEIVED | REFUND_REQUESTED | ...
+  fromState String?
+  toState   String?
+  payload   String? // JSON-encoded
+  createdAt DateTime @default(now())
+
+  payment Payment @relation(fields: [paymentId], references: [id], onDelete: Cascade)
+
+  @@index([paymentId])
+}
+
+// ---------------------------------------------------------------------------
+// WebhookEvent — dedupe store. Unique (provider, eventId) is what makes
+// webhook processing idempotent (PRD §6).
+// ---------------------------------------------------------------------------
+model WebhookEvent {
+  id          String   @id @default(cuid())
+  provider    String
+  eventId     String
+  signature   String?
+  payload     String // raw JSON body as received
+  processed   Boolean  @default(false)
+  duplicate   Boolean  @default(false)
+  error       String?
+  createdAt   DateTime @default(now())
+
+  @@unique([provider, eventId])
+  @@index([createdAt])
+}
+
+// ---------------------------------------------------------------------------
+// Refund — must go through PaymentService, never the frontend (PRD §23).
+// ---------------------------------------------------------------------------
+model Refund {
+  id        String   @id @default(cuid())
+  paymentId String
+  amount    Int // minor units
+  status    String // PENDING | SUCCEEDED | FAILED
+  reason    String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  payment Payment @relation(fields: [paymentId], references: [id], onDelete: Cascade)
+
+  // A payment can be refunded at most once. Guards the double-refund race: two
+  // concurrent refunds cannot both insert a SUCCEEDED row.
+  @@unique([paymentId, status])
+  @@index([paymentId])
+  @@index([status])
+}
+
+// ---------------------------------------------------------------------------
+// LedgerEntry — double-entry-style split of a payment (PRD §21/§22).
+// Invariant: HOST_REVENUE + PLATFORM_REVENUE + GATEWAY_FEE = FULL_PAYMENT.
+// ---------------------------------------------------------------------------
+model LedgerEntry {
+  id        String   @id @default(cuid())
+  paymentId String
+  type      String // FULL_PAYMENT | HOST_REVENUE | PLATFORM_REVENUE | GATEWAY_FEE | REFUND
+  amount    Int // minor units, signed
+  createdAt DateTime @default(now())
+
+  payment Payment @relation(fields: [paymentId], references: [id], onDelete: Cascade)
+
+  // One entry of each kind per payment. This is the structural guard that makes
+  // ledger writes idempotent: a duplicated webhook or a concurrent refund
+  // cannot insert a second FULL_PAYMENT / REFUND row even if the service-level
+  // check is bypassed by a race.
+  @@unique([paymentId, type])
+  @@index([paymentId])
+  @@index([type])
+}
+
+// ---------------------------------------------------------------------------
+// Notification — created atomically alongside the payment transition (PRD §22).
+// ---------------------------------------------------------------------------
+model Notification {
+  id        String   @id @default(cuid())
+  bookingId String
+  channel   String // email | log
+  recipient String
+  subject   String?
+  body      String?
+  sentAt    DateTime?
+  createdAt DateTime @default(now())
+
+  booking Booking @relation(fields: [bookingId], references: [id], onDelete: Cascade)
+
+  @@index([bookingId])
+  @@index([sentAt])
+}
