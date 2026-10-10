@@ -1,4 +1,4 @@
-# RoomStack — Room Booking Platform Backend
+# Spotto — Room/space Booking Platform Backend
 
 A room booking and rental platform API where **customers book and pay without
 creating an account**. Hosts and administrators authenticate; guests do not.
